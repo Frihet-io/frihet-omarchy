@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "io.frihet.erp",
+  "name": "Frihet ERP",
+  "version": "1.0.0",
+  "author": "Frihet",
+  "license": "MIT",
+  "description": "Live monthly revenue, overdue invoice alerts, and VAT snapshot for the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Frihet ERP",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "showAmountInBar": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "number",
+        "label": "Refresh interval (seconds)"
+      },
+      {
+        "key": "showAmountInBar",
+        "type": "boolean",
+        "label": "Show current month net revenue in bar"
+      }
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+.DS_Store
+*.bak
+*.log
+node_modules/
+aur/*/pkg/
+aur/*/src/
+aur/*/*.pkg.tar.*
+aur/*/*.tgz

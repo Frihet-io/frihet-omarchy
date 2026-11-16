@@ -1,0 +1,18 @@
+pkgbase = frihet-mcp
+	pkgdesc = Official MCP server and terminal CLI for Frihet ERP on Arch Linux & Omarchy
+	pkgver = 2.0.2
+	pkgrel = 1
+	url = https://github.com/Frihet-io/frihet-mcp
+	arch = any
+	license = MIT
+	makedepends = npm
+	depends = nodejs>=20
+	noextract = mcp-server-2.0.2.tgz
+	source = mcp-server-2.0.2.tgz::https://registry.npmjs.org/@frihet/mcp-server/-/mcp-server-2.0.2.tgz
+	source = frihet-cli
+	source = frihet-omarchy-setup
+	sha256sums = e8aac17728b17fec38a1890649d8cc05a1f7e6192f6b92e9f8b6dd4ad5f81977
+	sha256sums = 6831132bfdc252af91577e63219eb0e4142dc09211c08d4aa05574dacdfa8b3a
+	sha256sums = b0bc3d8c9da9256f264086a87302ca8e2c8ba4ff409149752bc34ef152fccec0
+
+pkgname = frihet-mcp

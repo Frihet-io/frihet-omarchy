@@ -1,0 +1,342 @@
+#!/usr/bin/env node
+"use strict";
+
+(async function run() {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+
+  const MAX_RESPONSE_BYTES = 262144;
+  const REQUEST_TIMEOUT_MS = 8000;
+  const DEFAULT_API_BASE_URL = "https://api.frihet.io/v1";
+
+  function redactSecrets(text) {
+    return String(text || "").replace(/fri_[A-Za-z0-9_-]+/g, "[REDACTED]");
+  }
+
+  function getDefaultEnvPath() {
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+    return path.join(configHome, "frihet", "env");
+  }
+
+  function parseEnvFile(filePath) {
+    const result = {};
+    if (!filePath || !fs.existsSync(filePath)) return result;
+    const content = fs.readFileSync(filePath, "utf8");
+    const lines = content.split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const withoutExport = line.startsWith("export ") ? line.slice(7).trim() : line;
+      const eqIndex = withoutExport.indexOf("=");
+      if (eqIndex <= 0) continue;
+      const key = withoutExport.slice(0, eqIndex).trim();
+      let val = withoutExport.slice(eqIndex + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
+        (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
+      ) {
+        val = val.slice(1, -1);
+      }
+      result[key] = val;
+    }
+    return result;
+  }
+
+  function loadConfig() {
+    const envPath = process.env.FRIHET_CONFIG_ENV || getDefaultEnvPath();
+    const fileVars = parseEnvFile(envPath);
+    const apiKey = (process.env.FRIHET_API_KEY || fileVars.FRIHET_API_KEY || "").trim();
+    const apiUrl = (process.env.FRIHET_API_URL || fileVars.FRIHET_API_URL || DEFAULT_API_BASE_URL).trim();
+    return { apiKey, apiUrl, envPath };
+  }
+
+  class FetchError extends Error {
+    constructor(errorCode, message) {
+      super(redactSecrets(message));
+      this.name = "FetchError";
+      this.errorCode = errorCode;
+    }
+  }
+
+  function validateSafeApiBaseUrl(rawUrl) {
+    const candidate = String(rawUrl || DEFAULT_API_BASE_URL).trim().replace(/\/+$/, "");
+    let parsed;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      throw new FetchError("invalid_base_url", "Invalid Frihet API base URL configured.");
+    }
+
+    if (parsed.username || parsed.password) {
+      throw new FetchError("invalid_base_url", "API base URL must not embed credentials.");
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+    const allowLoopback = process.env.FRIHET_ALLOW_LOOPBACK_TEST === "1";
+
+    if (isLoopback) {
+      if (!allowLoopback) {
+        throw new FetchError("untrusted_base_url", "Loopback API URL is disabled outside test mode.");
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new FetchError("invalid_base_url", "API base URL must use HTTP or HTTPS.");
+      }
+      return candidate;
+    }
+
+    if (parsed.protocol !== "https:") {
+      throw new FetchError("insecure_base_url", "Frihet API base URL must use HTTPS.");
+    }
+
+    if (host !== "api.frihet.io" && !host.endsWith(".frihet.io")) {
+      throw new FetchError("untrusted_base_url", "Frihet API key can only be sent to *.frihet.io origins.");
+    }
+
+    return candidate;
+  }
+
+  function currentLocalYearMonth() {
+    const now = new Date();
+    const year = String(now.getFullYear());
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    return `${year}-${month}`;
+  }
+
+  async function readBoundedText(res, maxBytes) {
+    if (!res.body) return "";
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {
+            // ignore cancel errors
+          }
+          throw new FetchError("response_too_large", `API response exceeded ${maxBytes} byte cap.`);
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+
+    return Buffer.concat(chunks, total).toString("utf8");
+  }
+
+  async function fetchBoundedJson(url, apiKey) {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        headers: {
+          "X-API-Key": apiKey,
+          "X-Frihet-Source": "omarchy-quickshell",
+          "User-Agent": "frihet-omarchy/1.0.0",
+          "Accept": "application/json"
+        }
+      });
+    } catch (err) {
+      const msg = err && err.name === "TimeoutError"
+        ? "Frihet API request timed out."
+        : `Could not reach Frihet API: ${err && err.message ? err.message : "network error"}`;
+      throw new FetchError("network_error", msg);
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      throw new FetchError("redirect_blocked", `Refusing HTTP redirect (${res.status}) from API.`);
+    }
+
+    const text = await readBoundedText(res, MAX_RESPONSE_BYTES);
+    let parsed = null;
+    if (text.trim() !== "") {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        if (res.ok) {
+          throw new FetchError("invalid_json", "Frihet API returned invalid JSON.");
+        }
+      }
+    }
+
+    if (!res.ok) {
+      const detail = parsed && typeof parsed === "object"
+        ? (parsed.message || parsed.error || "")
+        : "";
+      if (res.status === 401) {
+        throw new FetchError("unauthorized", `Invalid or revoked API key (401). ${detail}`.trim());
+      }
+      if (res.status === 403) {
+        throw new FetchError("forbidden", `API key lacks workspace permissions (403). ${detail}`.trim());
+      }
+      if (res.status === 429) {
+        throw new FetchError("rate_limited", "Frihet API rate limit exceeded (429). Retry shortly.");
+      }
+      throw new FetchError("http_error", `Frihet API error (${res.status}). ${detail}`.trim());
+    }
+
+    return parsed;
+  }
+
+  function unwrapObject(raw) {
+    if (!raw || typeof raw !== "object") return {};
+    if (raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)) {
+      return raw.data;
+    }
+    return raw;
+  }
+
+  function firstFinite(...values) {
+    for (const v of values) {
+      if (typeof v === "number" && Number.isFinite(v)) return v;
+    }
+    return null;
+  }
+
+  function nonNegInt(v) {
+    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
+  }
+
+  function extractInvoicesArray(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (!raw || typeof raw !== "object") return [];
+    if (Array.isArray(raw.data)) return raw.data;
+    if (Array.isArray(raw.items)) return raw.items;
+    if (Array.isArray(raw.invoices)) return raw.invoices;
+    if (raw.data && typeof raw.data === "object") {
+      if (Array.isArray(raw.data.items)) return raw.data.items;
+      if (Array.isArray(raw.data.invoices)) return raw.data.invoices;
+    }
+    return [];
+  }
+
+  async function main() {
+    const { apiKey, apiUrl } = loadConfig();
+
+    if (!apiKey) {
+      process.stdout.write(
+        JSON.stringify({
+          ok: false,
+          errorCode: "missing_api_key",
+          error: "API key not configured. Run frihet-omarchy-setup."
+        }) + "\n"
+      );
+      return;
+    }
+
+    const safeBaseUrl = validateSafeApiBaseUrl(apiUrl);
+    const period = currentLocalYearMonth();
+
+    const [ctxRaw, monthlyRaw, invoicesRaw] = await Promise.all([
+      fetchBoundedJson(`${safeBaseUrl}/context`, apiKey),
+      fetchBoundedJson(`${safeBaseUrl}/monthly?month=${encodeURIComponent(period)}`, apiKey),
+      fetchBoundedJson(`${safeBaseUrl}/invoices?limit=5`, apiKey)
+    ]);
+
+    const ctx = unwrapObject(ctxRaw);
+    const monthly = unwrapObject(monthlyRaw);
+    const rawList = extractInvoicesArray(invoicesRaw);
+
+    const workspaceName = String(
+      ctx.workspaceName ||
+        ctx.businessName ||
+        ctx.companyName ||
+        ctx.name ||
+        (ctx.workspace && ctx.workspace.name) ||
+        "Frihet ERP"
+    ).trim() || "Frihet ERP";
+
+    const currency = String(
+      ctx.currency ||
+        ctx.defaultCurrency ||
+        (ctx.workspace && ctx.workspace.currency) ||
+        monthly.currency ||
+        "EUR"
+    ).trim().toUpperCase() || "EUR";
+
+    const revenueTotal = firstFinite(monthly.revenue && monthly.revenue.total, monthly.revenueTotal);
+    const expensesTotal = firstFinite(monthly.expenses && monthly.expenses.total, monthly.expensesTotal);
+    const netProfit = firstFinite(
+      monthly.profit && monthly.profit.net,
+      monthly.profit && monthly.profit.gross,
+      monthly.netProfit
+    );
+    const vatPayable = firstFinite(
+      monthly.taxLiability && monthly.taxLiability.vatPayable,
+      monthly.taxLiability && monthly.taxLiability.estimatedModel303,
+      monthly.vatPayable
+    );
+
+    const invCounts = (monthly.invoices && typeof monthly.invoices === "object"
+      ? monthly.invoices
+      : monthly.counts && typeof monthly.counts === "object"
+        ? monthly.counts
+        : {});
+
+    const recentInvoices = rawList.slice(0, 5).map((inv) => {
+      const item = inv && typeof inv === "object" ? inv : {};
+      return {
+        id: String(item.id || ""),
+        number: String(item.invoiceNumber || item.documentNumber || item.number || item.id || "-"),
+        clientName: String(
+          item.clientName ||
+            item.counterpartyName ||
+            (item.client && item.client.name) ||
+            "Client"
+        ),
+        status: String(item.status || "unknown"),
+        amount: firstFinite(item.total, item.amount),
+        currency: String(item.currency || currency).toUpperCase()
+      };
+    });
+
+    const totalInvoicesCount = nonNegInt(
+      firstFinite(
+        invoicesRaw && invoicesRaw.total,
+        invoicesRaw && invoicesRaw.meta && invoicesRaw.meta.total,
+        invoicesRaw && invoicesRaw.pagination && invoicesRaw.pagination.total,
+        invoicesRaw && invoicesRaw.data && !Array.isArray(invoicesRaw.data) && invoicesRaw.data.total,
+        recentInvoices.length
+      )
+    );
+
+    const payload = {
+      ok: true,
+      workspaceName,
+      currency,
+      period,
+      revenueTotal,
+      expensesTotal,
+      netProfit,
+      vatPayable,
+      counts: {
+        created: nonNegInt(invCounts.created),
+        sent: nonNegInt(invCounts.sent),
+        paid: nonNegInt(invCounts.paid),
+        overdue: nonNegInt(invCounts.overdue),
+        draft: nonNegInt(invCounts.draft)
+      },
+      recentInvoices,
+      totalInvoicesCount,
+      updatedAt: new Date().toISOString()
+    };
+
+    process.stdout.write(JSON.stringify(payload) + "\n");
+  }
+
+  try {
+    await main();
+  } catch (err) {
+    const errorCode = err && err.errorCode ? String(err.errorCode) : "fetch_failed";
+    const error = redactSecrets(err && err.message ? err.message : "Failed to fetch Frihet data");
+    process.stdout.write(JSON.stringify({ ok: false, errorCode, error }) + "\n");
+  }
+})();

@@ -1,0 +1,63 @@
+#!/usr/bin/env sh
+set -eu
+
+RAW_ARG="${1:-}"
+BASE_URL="https://app.frihet.io"
+
+case "$RAW_ARG" in
+  "")
+    CLEAN_PATH=""
+    ;;
+  "https://app.frihet.io")
+    CLEAN_PATH=""
+    ;;
+  https://app.frihet.io/*)
+    CLEAN_PATH="${RAW_ARG#https://app.frihet.io/}"
+    ;;
+  http://* | https://* | *://*)
+    printf '%s\n' "frihet-erp-webapp: refusing non-app.frihet.io URL" >&2
+    exit 2
+    ;;
+  *)
+    CLEAN_PATH="$RAW_ARG"
+    ;;
+esac
+
+while [ "${CLEAN_PATH#/}" != "$CLEAN_PATH" ]; do
+  CLEAN_PATH="${CLEAN_PATH#/}"
+done
+
+case "$CLEAN_PATH" in
+  *..*)
+    printf '%s\n' "frihet-erp-webapp: invalid route path" >&2
+    exit 2
+    ;;
+esac
+
+if ! printf '%s' "$CLEAN_PATH" | grep -Eq '^[A-Za-z0-9/_?=&.%-]*$'; then
+  printf '%s\n' "frihet-erp-webapp: invalid characters in route" >&2
+  exit 2
+fi
+
+if [ -n "$CLEAN_PATH" ]; then
+  TARGET_URL="${BASE_URL}/${CLEAN_PATH}"
+else
+  TARGET_URL="${BASE_URL}"
+fi
+
+if command -v omarchy-launch-webapp >/dev/null 2>&1; then
+  exec omarchy-launch-webapp "$TARGET_URL"
+fi
+
+for BROWSER in chromium chromium-browser brave google-chrome-stable; do
+  if command -v "$BROWSER" >/dev/null 2>&1; then
+    exec "$BROWSER" --ozone-platform-hint=auto --app="$TARGET_URL"
+  fi
+done
+
+if command -v xdg-open >/dev/null 2>&1; then
+  exec xdg-open "$TARGET_URL"
+fi
+
+printf '%s\n' "frihet-erp-webapp: no Chromium browser, omarchy-launch-webapp, or xdg-open found in PATH" >&2
+exit 1

@@ -1,0 +1,403 @@
+#!/usr/bin/env node
+"use strict";
+
+(async function run() {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const readline = await import("node:readline");
+
+  const DEFAULT_API_BASE_URL = "https://api.frihet.io/v1";
+  const REQUEST_TIMEOUT_MS = 8000;
+  const MAX_RESPONSE_BYTES = 262144;
+
+  function redactSecrets(text) {
+    return String(text || "").replace(/fri_[A-Za-z0-9_-]+/g, "[REDACTED]");
+  }
+
+  function maskKey(key) {
+    const s = String(key || "");
+    if (s.length <= 8) return "****";
+    if (s.startsWith("fri_")) {
+      return `fri_...${s.slice(-4)}`;
+    }
+    return `***${s.slice(-4)}`;
+  }
+
+  function validateSafeApiBaseUrl(rawUrl) {
+    const candidate = String(rawUrl || DEFAULT_API_BASE_URL).trim().replace(/\/+$/, "");
+    let parsed;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      throw new Error("Invalid Frihet API base URL.");
+    }
+
+    if (parsed.username || parsed.password) {
+      throw new Error("API base URL must not embed credentials.");
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+    const allowLoopback = process.env.FRIHET_ALLOW_LOOPBACK_TEST === "1";
+
+    if (isLoopback) {
+      if (!allowLoopback) {
+        throw new Error("Loopback API URL is disabled outside test mode.");
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error("API base URL must use HTTP or HTTPS.");
+      }
+      return candidate;
+    }
+
+    if (parsed.protocol !== "https:") {
+      throw new Error("Frihet API base URL must use HTTPS.");
+    }
+
+    if (host !== "api.frihet.io" && !host.endsWith(".frihet.io")) {
+      throw new Error("Frihet API key can only be sent to *.frihet.io origins.");
+    }
+
+    return candidate;
+  }
+
+  function printHelp() {
+    process.stdout.write(
+      [
+        "frihet-omarchy-setup - Configure Frihet ERP credentials for Omarchy, Claude Code, and OpenCode",
+        "",
+        "Usage:",
+        "  frihet-omarchy-setup [options]",
+        "",
+        "Options:",
+        "  --api-key-stdin          Read API key from stdin",
+        "  --api-url <url>          Frihet API base URL (default: https://api.frihet.io/v1)",
+        "  --config-env <path>      Override env file path (default: ~/.config/frihet/env)",
+        "  --claude-config <path>   Override Claude Code config path (default: ~/.claude.json)",
+        "  --opencode-config <path> Override OpenCode config path (default: ~/.config/opencode/opencode.json)",
+        "  --skip-verify            Skip live GET /context verification",
+        "  --dry-run                Validate and preview without writing files",
+        "  --help, -h               Show this help message",
+        ""
+      ].join("\n")
+    );
+  }
+
+  function parseArgs(argv) {
+    const opts = {
+      apiKeyStdin: false,
+      apiUrl: process.env.FRIHET_API_URL || DEFAULT_API_BASE_URL,
+      envFile: "",
+      claudeConfig: "",
+      opencodeConfig: "",
+      opencodeExplicit: false,
+      skipVerify: false,
+      dryRun: false,
+      help: false
+    };
+
+    for (let i = 0; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg === "--help" || arg === "-h") {
+        opts.help = true;
+      } else if (arg === "--api-key-stdin") {
+        opts.apiKeyStdin = true;
+      } else if (arg === "--skip-verify") {
+        opts.skipVerify = true;
+      } else if (arg === "--dry-run") {
+        opts.dryRun = true;
+      } else if (arg === "--api-url") {
+        i++;
+        if (!argv[i]) throw new Error("--api-url requires a value");
+        opts.apiUrl = argv[i];
+      } else if (arg === "--config-env" || arg === "--env-file") {
+        i++;
+        if (!argv[i]) throw new Error(`${arg} requires a value`);
+        opts.envFile = argv[i];
+      } else if (arg === "--claude-config") {
+        i++;
+        if (!argv[i]) throw new Error("--claude-config requires a value");
+        opts.claudeConfig = argv[i];
+      } else if (arg === "--opencode-config") {
+        i++;
+        if (!argv[i]) throw new Error("--opencode-config requires a value");
+        opts.opencodeConfig = argv[i];
+        opts.opencodeExplicit = true;
+      } else {
+        throw new Error(`Unknown option: ${arg}`);
+      }
+    }
+
+    return opts;
+  }
+
+  function readStdinTrimmed() {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      process.stdin.on("data", (chunk) => chunks.push(chunk));
+      process.stdin.on("end", () => {
+        resolve(Buffer.concat(chunks).toString("utf8").trim());
+      });
+      process.stdin.on("error", reject);
+    });
+  }
+
+  function promptHidden(question) {
+    return new Promise((resolve, reject) => {
+      if (!process.stdin.isTTY) {
+        reject(new Error("No TTY available. Pass --api-key-stdin or FRIHET_API_KEY."));
+        return;
+      }
+
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: true
+      });
+
+      const originalWrite = rl._writeToOutput;
+      rl._writeToOutput = function writeMasked(str) {
+        if (str.includes(question)) {
+          originalWrite.call(rl, question);
+        }
+      };
+
+      rl.question(question, (answer) => {
+        rl.close();
+        process.stdout.write("\n");
+        resolve(String(answer || "").trim());
+      });
+    });
+  }
+
+  function validateApiKey(rawKey) {
+    const key = String(rawKey || "").trim();
+    if (!key) {
+      throw new Error("Frihet API key is required.");
+    }
+    if (/[\r\n\s"'`\\]/.test(key)) {
+      throw new Error("Frihet API key contains invalid whitespace or quote characters.");
+    }
+    return key;
+  }
+
+  async function readBoundedText(res, maxBytes) {
+    if (!res.body) return "";
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {
+            // ignore
+          }
+          throw new Error(`API response exceeded ${maxBytes} byte limit.`);
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+
+    return Buffer.concat(chunks, total).toString("utf8");
+  }
+
+  async function verifyApiKey(safeBaseUrl, apiKey) {
+    let res;
+    try {
+      res = await fetch(`${safeBaseUrl}/context`, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        headers: {
+          "X-API-Key": apiKey,
+          "X-Frihet-Source": "omarchy-setup",
+          "User-Agent": "frihet-omarchy-setup/1.0.0",
+          "Accept": "application/json"
+        }
+      });
+    } catch (err) {
+      throw new Error(
+        `Could not verify API key against ${safeBaseUrl}: ${redactSecrets(err && err.message ? err.message : "network error")}`
+      );
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      throw new Error(`Refusing HTTP redirect (${res.status}) during API key verification.`);
+    }
+
+    const text = await readBoundedText(res, MAX_RESPONSE_BYTES);
+    if (!res.ok) {
+      throw new Error(`API key verification failed with HTTP ${res.status}.`);
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      const ctx = parsed && parsed.data && typeof parsed.data === "object" ? parsed.data : parsed;
+      return String(
+        (ctx && (ctx.workspaceName || ctx.businessName || ctx.companyName || ctx.name || (ctx.workspace && ctx.workspace.name))) ||
+          "Frihet ERP"
+      ).trim();
+    } catch {
+      return "Frihet ERP";
+    }
+  }
+
+  function ensurePrivateDir(dirPath) {
+    fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dirPath, 0o700);
+  }
+
+  function writePrivateFile(filePath, content) {
+    ensurePrivateDir(path.dirname(filePath));
+    fs.writeFileSync(filePath, content, { encoding: "utf8", mode: 0o600 });
+    fs.chmodSync(filePath, 0o600);
+  }
+
+  function mergeJsonConfig(filePath, updater) {
+    let data = {};
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, "utf8");
+      if (raw.trim() !== "") {
+        try {
+          data = JSON.parse(raw);
+        } catch (err) {
+          throw new Error(`Refusing to overwrite malformed JSON at ${filePath}: ${err.message}`);
+        }
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          throw new Error(`Refusing to overwrite non-object JSON config at ${filePath}`);
+        }
+      }
+      const backupPath = `${filePath}.bak`;
+      fs.writeFileSync(backupPath, raw, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(backupPath, 0o600);
+    }
+
+    const updated = updater(data);
+    writePrivateFile(filePath, `${JSON.stringify(updated, null, 2)}\n`);
+  }
+
+  async function main() {
+    const opts = parseArgs(process.argv.slice(2));
+    if (opts.help) {
+      printHelp();
+      return;
+    }
+
+    const safeBaseUrl = validateSafeApiBaseUrl(opts.apiUrl);
+
+    let rawKey = "";
+    if (opts.apiKeyStdin) {
+      rawKey = await readStdinTrimmed();
+    } else if (process.env.FRIHET_API_KEY) {
+      rawKey = process.env.FRIHET_API_KEY;
+    } else {
+      rawKey = await promptHidden("Enter your Frihet API key (fri_...): ");
+    }
+
+    const apiKey = validateApiKey(rawKey);
+    const masked = maskKey(apiKey);
+
+    let verifiedWorkspace = null;
+    if (!opts.skipVerify && !opts.dryRun) {
+      verifiedWorkspace = await verifyApiKey(safeBaseUrl, apiKey);
+    }
+
+    const home = os.homedir();
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+    const envFile = opts.envFile || path.join(configHome, "frihet", "env");
+    const claudeConfig = opts.claudeConfig || path.join(home, ".claude.json");
+    const opencodeConfig = opts.opencodeConfig || path.join(configHome, "opencode", "opencode.json");
+    const shouldWriteOpencode =
+      opts.opencodeExplicit ||
+      fs.existsSync(opencodeConfig) ||
+      fs.existsSync(path.dirname(opencodeConfig));
+
+    if (opts.dryRun) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            dryRun: true,
+            maskedKey: masked,
+            apiUrl: safeBaseUrl,
+            envFile,
+            claudeConfig,
+            opencodeConfig: shouldWriteOpencode ? opencodeConfig : null
+          },
+          null,
+          2
+        ) + "\n"
+      );
+      return;
+    }
+
+    const envBody = [
+      "# Managed by frihet-omarchy-setup (0600)",
+      `FRIHET_API_KEY=${apiKey}`,
+      `FRIHET_API_URL=${safeBaseUrl}`,
+      ""
+    ].join("\n");
+    writePrivateFile(envFile, envBody);
+
+    mergeJsonConfig(claudeConfig, (cfg) => {
+      const next = { ...cfg };
+      const existingServers =
+        next.mcpServers && typeof next.mcpServers === "object" && !Array.isArray(next.mcpServers)
+          ? { ...next.mcpServers }
+          : {};
+      existingServers.frihet = {
+        type: "stdio",
+        command: "frihet-mcp",
+        args: [],
+        env: {
+          FRIHET_API_KEY: apiKey
+        }
+      };
+      next.mcpServers = existingServers;
+      return next;
+    });
+
+    if (shouldWriteOpencode) {
+      mergeJsonConfig(opencodeConfig, (cfg) => {
+        const next = { ...cfg };
+        const existingMcp =
+          next.mcp && typeof next.mcp === "object" && !Array.isArray(next.mcp)
+            ? { ...next.mcp }
+            : {};
+        existingMcp.frihet = {
+          type: "local",
+          command: ["frihet-mcp"],
+          enabled: true,
+          environment: {
+            FRIHET_API_KEY: apiKey
+          }
+        };
+        next.mcp = existingMcp;
+        return next;
+      });
+    }
+
+    process.stdout.write(`Configured Frihet API key (${masked})\n`);
+    if (verifiedWorkspace) {
+      process.stdout.write(`Verified workspace: ${verifiedWorkspace}\n`);
+    }
+    process.stdout.write(`Env file (0600): ${envFile}\n`);
+    process.stdout.write(`Claude Code MCP: ${claudeConfig}\n`);
+    if (shouldWriteOpencode) {
+      process.stdout.write(`OpenCode MCP: ${opencodeConfig}\n`);
+    }
+  }
+
+  try {
+    await main();
+  } catch (err) {
+    process.stderr.write(`Error: ${redactSecrets(err && err.message ? err.message : "Setup failed")}\n`);
+    process.exit(1);
+  }
+})();

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Name=Frihet ERP
+GenericName=Business Management ERP
+Comment=AI-native invoicing, VeriFactu compliance, and finance for modern teams
+Exec=frihet-erp-webapp %u
+Icon=frihet-erp
+Terminal=false
+Type=Application
+Categories=Office;Finance;
+StartupNotify=true
+StartupWMClass=app.frihet.io

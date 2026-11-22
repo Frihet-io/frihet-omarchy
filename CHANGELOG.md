@@ -2,10 +2,15 @@
 
 All notable changes to `frihet-omarchy` are documented in this file.
 
+## [1.1.0] - 2026-11-22
+
+### Changed
+- Dedicated repository exclusively to the `io.frihet.erp` Omarchy Quattro bar widget (moved Arch Linux PKGBUILDs and CLI tools to `Frihet-io/frihet-arch` for clean zero-capability Marketplace verification).
+- Replaced Node.js fetch helper with stock `/usr/bin/python3 -I` stdlib helper using `O_NOFOLLOW` descriptor-chain validation on `~/.config/frihet/env` (`0600`), fixed `https://api.frihet.io/v1` origin, disabled proxies, and strict byte/time caps.
+- Replaced `StdioCollector` and shell wrappers in `BarWidget.qml` with chunk-bounded `SplitParser`, process-group `setsid` + `timeout` supervision, generation tracking, and `Component.onDestruction` teardown.
+- Hardened `Model.js` string sanitization (`<`, `>`, `&`, C0/C1, bidi controls) and null-prototype currency maps; added live Quickshell `preview.png` and `qmllint` clean verification.
+
 ## [1.0.0] - 2026-11-16
 
 ### Added
-- **Omarchy Quattro Bar Widget (`io.frihet.erp`)**: `manifest.json`, `BarWidget.qml`, theme-aware `Panel.qml`, dual QML/Node `Model.js`, and `bin/frihet-omarchy-fetch` for live monthly revenue, overdue invoice alerts, VAT snapshot, and recent invoices.
-- **Frameless Wayland Web App (`aur/frihet-webapp`)**: `frihet-erp-webapp`, XDG desktop entry, pinned Frihet Brand OS v1 icons, `install-omarchy-webapp.sh` one-liner, `PKGBUILD`, and `.SRCINFO`.
-- **Terminal MCP + CLI (`aur/frihet-mcp`)**: Arch package wrapping `@frihet/mcp-server@2.0.2`, `frihet-omarchy-setup` (`0600` credential config + non-destructive Claude Code & OpenCode MCP setup), and `frihet-cli` (`status`, `monthly`, `quarterly`, `invoices`, and draft-only `draft-invoice`).
-- **Verification & Security Gates**: `tests/omarchy-suite.test.mjs`, `scripts/no-public-leak.mjs`, and SHA-pinned GitHub Actions CI (`ci.yml`).
+- Initial release of `io.frihet.erp` Quickshell bar widget (`manifest.json`, `BarWidget.qml`, `Panel.qml`, `Model.js`, `bin/frihet-omarchy-fetch`).

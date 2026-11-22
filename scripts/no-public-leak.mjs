@@ -15,7 +15,7 @@ const failures = [];
 function walkFiles(dirPath) {
   const out = [];
   for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
-    if (entry.name === ".git" || entry.name === "node_modules") continue;
+    if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "__pycache__") continue;
     const fullPath = path.join(dirPath, entry.name);
     if (entry.isDirectory()) {
       out.push(...walkFiles(fullPath));
@@ -26,7 +26,7 @@ function walkFiles(dirPath) {
   return out;
 }
 
-const BINARY_EXTS = new Set([".png", ".jpg", ".jpeg", ".ico", ".icns", ".woff", ".woff2", ".tgz"]);
+const BINARY_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".avif", ".ico", ".icns", ".woff", ".woff2", ".tgz"]);
 const COMPETITOR_RE = /\b(holded|quickbooks|anfix|contasimple|quipu|odoo|billin|sage|factorial|a3erp|declarando|txerpa|xero|zoho)\b/i;
 const INTERNAL_MARKERS = [
   /SOUL\.md/i,
@@ -58,8 +58,8 @@ for (const filePath of walkFiles(REPO_ROOT)) {
     failures.push(`Forbidden credential file in repo: ${relPath}`);
     continue;
   }
-  if (base.endsWith(".bak")) {
-    failures.push(`Backup artifact should not be committed: ${relPath}`);
+  if (base.endsWith(".bak") || base.endsWith(".pyc")) {
+    failures.push(`Artifact should not be committed: ${relPath}`);
   }
 
   if (BINARY_EXTS.has(path.extname(relPath).toLowerCase())) continue;
@@ -72,8 +72,11 @@ for (const filePath of walkFiles(REPO_ROOT)) {
     }
   }
 
-  if (relPath !== "tests/omarchy-suite.test.mjs" && /fri_[A-Za-z0-9_-]{8,}/.test(content)) {
+  if (relPath !== "tests/omarchy-suite.test.mjs" && relPath !== "README.md" && /fri_[A-Za-z0-9_-]{8,}/.test(content)) {
     failures.push(`Literal fri_* API token pattern found in ${relPath}`);
+  }
+  if (relPath === "README.md" && /fri_(?!your_key_here\b)[A-Za-z0-9_-]{8,}/.test(content)) {
+    failures.push(`Non-placeholder fri_* token found in README.md`);
   }
 
   if (COMPETITOR_RE.test(content)) {

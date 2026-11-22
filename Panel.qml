@@ -2,7 +2,6 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Layouts
-import Quickshell
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -17,7 +16,7 @@ Panel {
   property var hostWidget: null
 
   readonly property var barIdentity: hostWidget || root
-  readonly property var state: hostWidget ? hostWidget.frihetState : Model.emptyState()
+  readonly property var snapshot: hostWidget ? hostWidget.frihetState : Model.emptyState()
   readonly property string hostError: hostWidget ? String(hostWidget.lastError || "") : ""
   readonly property bool refreshing: hostWidget ? hostWidget.refreshing === true : false
 
@@ -39,7 +38,7 @@ Panel {
   }
 
   function open() {
-    refresh()
+    root.refresh()
     root.controller.show()
   }
 
@@ -65,18 +64,30 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    centerOnBar: false
+    focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(560))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(560))
 
-    PanelKeyCatcher {
+    content: PanelKeyCatcher {
       id: keyCatcher
+      implicitHeight: bodyColumn.implicitHeight
       anchors.fill: parent
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTextKey: function(keyText) {
+        if (keyText === "r") root.refresh()
+        else if (keyText === "n") {
+          root.openWebApp("invoices/new")
+          root.close()
+        } else if (keyText === "o") {
+          root.openWebApp("")
+          root.close()
+        }
+      }
 
       Column {
-        id: content
+        id: bodyColumn
         width: parent.width
         spacing: Style.space(10)
 
@@ -90,7 +101,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: Model.clean(root.state.workspaceName || "Frihet ERP", 48)
+              text: Model.clean(root.snapshot.workspaceName || "Frihet ERP", 48)
               textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
@@ -101,8 +112,8 @@ Panel {
 
             Text {
               width: parent.width
-              text: root.state.period
-                ? "Period: " + Model.clean(root.state.period, 16)
+              text: root.snapshot.period
+                ? "Period: " + Model.clean(root.snapshot.period, 16)
                 : "Monthly business snapshot"
               textFormat: Text.PlainText
               color: root.contentDim
@@ -114,7 +125,7 @@ Panel {
 
           PanelActionButton {
             iconText: "󰑐"
-            tooltipText: "Refresh"
+            tooltipText: "Refresh (r)"
             foreground: root.contentForeground
             fontFamily: root.contentFontFamily
             enabled: !root.refreshing
@@ -123,7 +134,7 @@ Panel {
 
           PanelActionButton {
             iconText: "+"
-            tooltipText: "New draft invoice"
+            tooltipText: "New draft invoice (n)"
             foreground: root.contentForeground
             fontFamily: root.contentFontFamily
             onClicked: {
@@ -134,7 +145,7 @@ Panel {
 
           PanelActionButton {
             iconText: "↗"
-            tooltipText: "Open Frihet ERP"
+            tooltipText: "Open Frihet ERP (o)"
             foreground: root.contentForeground
             fontFamily: root.contentFontFamily
             onClicked: {
@@ -151,10 +162,10 @@ Panel {
         }
 
         Rectangle {
-          visible: !root.state.configured || root.hostError !== ""
+          visible: !root.snapshot.configured || root.hostError !== ""
           width: parent.width
           implicitHeight: bannerText.implicitHeight + Style.space(12)
-          radius: Style.radius ? Style.radius.small : 6
+          radius: Style.cornerRadius
           color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.14)
 
           Text {
@@ -163,8 +174,8 @@ Panel {
             anchors.leftMargin: Style.space(8)
             anchors.verticalCenter: parent.verticalCenter
             width: parent.width - Style.space(16)
-            text: !root.state.configured
-              ? "Run frihet-omarchy-setup in terminal to configure your Frihet API key."
+            text: !root.snapshot.configured
+              ? "Configure ~/.config/frihet/env (mode 0600) with FRIHET_API_KEY=fri_..."
               : Model.clean(root.hostError, 160)
             textFormat: Text.PlainText
             color: root.urgent
@@ -174,14 +185,16 @@ Panel {
           }
         }
 
-        GridLayout {
+        Grid {
+          id: metricsGrid
           width: parent.width
           columns: 2
-          columnSpacing: Style.space(12)
-          rowSpacing: Style.space(8)
+          columnSpacing: Style.space(16)
+          rowSpacing: Style.space(10)
+          readonly property int cellWidth: Math.max(80, Math.floor((width - columnSpacing) / 2))
 
           Column {
-            Layout.fillWidth: true
+            width: metricsGrid.cellWidth
             spacing: Style.space(2)
 
             Text {
@@ -196,7 +209,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: Model.formatMoney(root.state.revenueTotal, root.state.currency, root.state.mixedCurrency)
+              text: Model.formatMoney(root.snapshot.revenueTotal, root.snapshot.currency, root.snapshot.mixedCurrency)
               textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
@@ -207,7 +220,7 @@ Panel {
           }
 
           Column {
-            Layout.fillWidth: true
+            width: metricsGrid.cellWidth
             spacing: Style.space(2)
 
             Text {
@@ -222,7 +235,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: Model.formatMoney(root.state.expensesTotal, root.state.currency, root.state.mixedCurrency)
+              text: Model.formatMoney(root.snapshot.expensesTotal, root.snapshot.currency, root.snapshot.mixedCurrency)
               textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
@@ -233,7 +246,7 @@ Panel {
           }
 
           Column {
-            Layout.fillWidth: true
+            width: metricsGrid.cellWidth
             spacing: Style.space(2)
 
             Text {
@@ -248,7 +261,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: Model.formatMoney(root.state.netProfit, root.state.currency, root.state.mixedCurrency)
+              text: Model.formatMoney(root.snapshot.netProfit, root.snapshot.currency, root.snapshot.mixedCurrency)
               textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
@@ -259,7 +272,7 @@ Panel {
           }
 
           Column {
-            Layout.fillWidth: true
+            width: metricsGrid.cellWidth
             spacing: Style.space(2)
 
             Text {
@@ -274,7 +287,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: Model.formatMoney(root.state.vatPayable, root.state.currency, root.state.mixedCurrency)
+              text: Model.formatMoney(root.snapshot.vatPayable, root.snapshot.currency, root.snapshot.mixedCurrency)
               textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
@@ -287,9 +300,9 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Paid: " + root.state.paidCount + "  Sent: " + root.state.sentCount + "  Overdue: " + root.state.overdueCount + "  Drafts: " + root.state.draftCount
+          text: "Paid: " + root.snapshot.paidCount + "  Sent: " + root.snapshot.sentCount + "  Overdue: " + root.snapshot.overdueCount + "  Drafts: " + root.snapshot.draftCount
           textFormat: Text.PlainText
-          color: root.state.overdueCount > 0 ? root.urgent : root.contentDim
+          color: root.snapshot.overdueCount > 0 ? root.urgent : root.contentDim
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
@@ -313,9 +326,9 @@ Panel {
         }
 
         Text {
-          visible: root.state.recentInvoices.length === 0
+          visible: root.snapshot.recentInvoices.length === 0
           width: parent.width
-          text: root.state.loading ? "Loading..." : "No recent invoices in sample."
+          text: root.snapshot.loading ? "Loading..." : "No recent invoices in sample."
           textFormat: Text.PlainText
           color: root.contentDim
           font.family: root.contentFontFamily
@@ -328,16 +341,17 @@ Panel {
           spacing: Style.space(4)
 
           Repeater {
-            model: root.state.recentInvoices
+            model: root.snapshot.recentInvoices
 
             Row {
+              id: invoiceRow
               required property var modelData
               width: parent.width
               spacing: Style.space(8)
 
               Text {
                 width: Math.floor(parent.width * 0.62)
-                text: Model.clean(parent.modelData.number + " " + parent.modelData.clientName, 48)
+                text: Model.clean(invoiceRow.modelData.number + " " + invoiceRow.modelData.clientName, 48)
                 textFormat: Text.PlainText
                 color: root.contentForeground
                 font.family: root.contentFontFamily
@@ -348,9 +362,9 @@ Panel {
               Text {
                 width: Math.floor(parent.width * 0.34)
                 horizontalAlignment: Text.AlignRight
-                text: Model.clean(parent.modelData.amountText + " (" + parent.modelData.status + ")", 28)
+                text: Model.clean(invoiceRow.modelData.amountText + " (" + invoiceRow.modelData.status + ")", 28)
                 textFormat: Text.PlainText
-                color: parent.modelData.status === "overdue" ? root.urgent : root.contentDim
+                color: invoiceRow.modelData.status === "overdue" ? root.urgent : root.contentDim
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
@@ -360,9 +374,9 @@ Panel {
         }
 
         Text {
-          visible: root.state.partialSample
+          visible: root.snapshot.partialSample
           width: parent.width
-          text: "Partial view: showing latest " + root.state.recentInvoices.length + " of " + root.state.totalInvoicesCount + " invoices"
+          text: "Partial view: showing latest " + root.snapshot.recentInvoices.length + " of " + root.snapshot.totalInvoicesCount + " invoices"
           textFormat: Text.PlainText
           color: root.contentDim
           font.family: root.contentFontFamily

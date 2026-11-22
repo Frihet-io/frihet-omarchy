@@ -1,342 +1,476 @@
-#!/usr/bin/env node
-"use strict";
+#!/usr/bin/env -S python3 -I
+import datetime
+import json
+import math
+import os
+import pwd
+import re
+import ssl
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-(async function run() {
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
+PROD_API_BASE = "https://api.frihet.io/v1"
+MAX_ENV_BYTES = 16384
+MAX_RESPONSE_BYTES = 262144
+MAX_ERROR_BYTES = 4096
+TOTAL_DEADLINE_SEC = 10.0
 
-  const MAX_RESPONSE_BYTES = 262144;
-  const REQUEST_TIMEOUT_MS = 8000;
-  const DEFAULT_API_BASE_URL = "https://api.frihet.io/v1";
+_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SECRET_RE = re.compile(r"fri_[A-Za-z0-9_-]+")
 
-  function redactSecrets(text) {
-    return String(text || "").replace(/fri_[A-Za-z0-9_-]+/g, "[REDACTED]");
-  }
 
-  function getDefaultEnvPath() {
-    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-    return path.join(configHome, "frihet", "env");
-  }
+class FetchError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(redact_secrets(message))
+        self.error_code = code
 
-  function parseEnvFile(filePath) {
-    const result = {};
-    if (!filePath || !fs.existsSync(filePath)) return result;
-    const content = fs.readFileSync(filePath, "utf8");
-    const lines = content.split(/\r?\n/);
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) continue;
-      const withoutExport = line.startsWith("export ") ? line.slice(7).trim() : line;
-      const eqIndex = withoutExport.indexOf("=");
-      if (eqIndex <= 0) continue;
-      const key = withoutExport.slice(0, eqIndex).trim();
-      let val = withoutExport.slice(eqIndex + 1).trim();
-      if (
-        (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
-        (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
-      ) {
-        val = val.slice(1, -1);
-      }
-      result[key] = val;
+
+def redact_secrets(text: str) -> str:
+    return _SECRET_RE.sub("[REDACTED]", str(text or ""))
+
+
+def ok_component(name: str) -> bool:
+    return bool(_COMPONENT_RE.fullmatch(name)) and name not in (".", "..")
+
+
+def open_readonly_dir_chain(anchor_path: str, parts: list[str]) -> int | None:
+    if not parts or not all(ok_component(p) for p in parts):
+        raise FetchError("unsafe_credentials_file", "Invalid configuration directory path.")
+    try:
+        fd = os.open(anchor_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        for name in parts:
+            try:
+                nfd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except FileNotFoundError:
+                os.close(fd)
+                return None
+            except OSError as exc:
+                raise FetchError(
+                    "unsafe_credentials_file",
+                    f"Refusing configuration directory component '{name}': {exc.strerror or 'invalid directory'}",
+                ) from exc
+            os.close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                raise FetchError(
+                    "unsafe_credentials_file",
+                    f"Untrusted configuration directory component '{name}'.",
+                )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_bounded_private_file(dirfd: int, filename: str, max_bytes: int) -> str | None:
+    if not ok_component(filename):
+        raise FetchError("unsafe_credentials_file", "Invalid configuration file name.")
+    try:
+        fd = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=dirfd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FetchError(
+            "unsafe_credentials_file",
+            f"Refusing ~/.config/frihet/{filename}: {exc.strerror or 'cannot open safely'}",
+        ) from exc
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise FetchError("unsafe_credentials_file", "Refusing non-regular ~/.config/frihet/env file.")
+        if st.st_uid != os.geteuid() or st.st_nlink != 1:
+            raise FetchError("unsafe_credentials_file", "Refusing ~/.config/frihet/env: must be owner-only with link count 1.")
+        if (st.st_mode & 0o077) != 0:
+            raise FetchError(
+                "unsafe_credentials_file",
+                "Permissions too open on ~/.config/frihet/env (run chmod 600 ~/.config/frihet/env).",
+            )
+        if st.st_size > max_bytes:
+            raise FetchError("unsafe_credentials_file", "Configuration file exceeds 16 KiB limit.")
+
+        os.set_blocking(fd, True)
+        chunks: list[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            chunk = os.read(fd, min(16384, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > max_bytes:
+            raise FetchError("unsafe_credentials_file", "Configuration file grew past 16 KiB limit.")
+        return b"".join(chunks).decode("utf-8", "strict")
+    finally:
+        os.close(fd)
+
+
+def parse_env_text(content: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        eq = line.find("=")
+        if eq <= 0:
+            continue
+        key = line[:eq].strip()
+        val = line[eq + 1 :].strip()
+        if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+            val = val[1:-1]
+        parsed[key] = val
+    return parsed
+
+
+def resolve_target_and_credentials() -> tuple[str, str]:
+    # Isolated local unit-test harness: never reads or reuses real user credentials.
+    if os.environ.get("FRIHET_ALLOW_LOOPBACK_TEST") == "1":
+        port_raw = os.environ.get("FRIHET_TEST_LOOPBACK_PORT", "").strip()
+        if port_raw:
+            if not port_raw.isdigit():
+                raise FetchError("invalid_base_url", "Invalid loopback test port.")
+            port = int(port_raw)
+            if port < 1024 or port > 65535:
+                raise FetchError("invalid_base_url", "Loopback test port out of range.")
+            test_key = os.environ.get("FRIHET_TEST_API_KEY", "").strip()
+            if not test_key:
+                return f"http://127.0.0.1:{port}/v1", ""
+            validate_api_key(test_key)
+            return f"http://127.0.0.1:{port}/v1", test_key
+
+        custom_root = os.environ.get("FRIHET_TEST_HOME", "").strip()
+        if custom_root:
+            dirfd = open_readonly_dir_chain(custom_root, [".config", "frihet"])
+            if dirfd is None:
+                return PROD_API_BASE, ""
+            try:
+                raw_env = read_bounded_private_file(dirfd, "env", MAX_ENV_BYTES)
+            finally:
+                os.close(dirfd)
+            if not raw_env:
+                return PROD_API_BASE, ""
+            env_map = parse_env_text(raw_env)
+            key = env_map.get("FRIHET_API_KEY", "").strip()
+            if key:
+                validate_api_key(key)
+            return PROD_API_BASE, key
+
+    home = pwd.getpwuid(os.geteuid()).pw_dir
+    dirfd = open_readonly_dir_chain(home, [".config", "frihet"])
+    if dirfd is None:
+        return PROD_API_BASE, ""
+    try:
+        raw_env = read_bounded_private_file(dirfd, "env", MAX_ENV_BYTES)
+    finally:
+        os.close(dirfd)
+
+    if not raw_env:
+        return PROD_API_BASE, ""
+    env_map = parse_env_text(raw_env)
+    api_key = env_map.get("FRIHET_API_KEY", "").strip()
+    if api_key:
+        validate_api_key(api_key)
+    return PROD_API_BASE, api_key
+
+
+def validate_api_key(key: str) -> None:
+    if len(key) > 256 or any(ch in key for ch in ("\r", "\n", "\x00", " ", "\t", '"', "'")):
+        raise FetchError("invalid_api_key", "API key contains invalid control or whitespace characters.")
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise FetchError("redirect_blocked", f"Refusing HTTP redirect ({code}) from API.")
+
+
+def build_opener(use_tls: bool) -> urllib.request.OpenerDirector:
+    handlers: list[urllib.request.BaseHandler] = [
+        urllib.request.ProxyHandler({}),
+        NoRedirectHandler(),
+    ]
+    if use_tls:
+        ctx = ssl.create_default_context()
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(*handlers)
+
+
+def fetch_bounded_json(opener: urllib.request.OpenerDirector, url: str, api_key: str, deadline: float):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.2:
+        raise FetchError("network_error", "Frihet API request timed out.")
+
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "X-API-Key": api_key,
+            "X-Frihet-Source": "omarchy-quickshell",
+            "User-Agent": "frihet-omarchy/1.1.0",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with opener.open(req, timeout=min(6.0, remaining)) as resp:
+            status = getattr(resp, "status", 200)
+            if 300 <= status < 400:
+                raise FetchError("redirect_blocked", f"Refusing HTTP redirect ({status}) from API.")
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise FetchError("response_too_large", f"API response exceeded {MAX_RESPONSE_BYTES} byte cap.")
+            text = raw.decode("utf-8", "replace")
+    except FetchError:
+        raise
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise FetchError("redirect_blocked", f"Refusing HTTP redirect ({exc.code}) from API.") from exc
+        detail = ""
+        try:
+            err_bytes = exc.read(MAX_ERROR_BYTES + 1)[:MAX_ERROR_BYTES]
+            err_obj = json.loads(err_bytes.decode("utf-8", "replace"))
+            if isinstance(err_obj, dict):
+                detail = str(err_obj.get("message") or err_obj.get("error") or "")[:160]
+        except Exception:
+            detail = ""
+        if exc.code == 401:
+            raise FetchError("unauthorized", f"Invalid or revoked API key (401). {detail}".strip()) from exc
+        if exc.code == 403:
+            raise FetchError("forbidden", f"API key lacks workspace permissions (403). {detail}".strip()) from exc
+        if exc.code == 429:
+            raise FetchError("rate_limited", "Frihet API rate limit exceeded (429). Retry shortly.") from exc
+        raise FetchError("http_error", f"Frihet API error ({exc.code}). {detail}".strip()) from exc
+    except Exception as exc:
+        raise FetchError("network_error", f"Could not reach Frihet API: {exc}") from exc
+
+    try:
+        return json.loads(text) if text.strip() else {}
+    except Exception as exc:
+        raise FetchError("invalid_json", "Frihet API returned invalid JSON.") from exc
+
+
+def unwrap_dict(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    inner = raw.get("data")
+    if isinstance(inner, dict):
+        return inner
+    return raw
+
+
+def first_finite(*values) -> float | None:
+    for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+            return float(v)
+    return None
+
+
+def non_neg_int(v) -> int:
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0:
+        return int(v)
+    return 0
+
+
+def extract_invoices_list(raw) -> list:
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, dict):
+        return []
+    for key in ("data", "items", "invoices"):
+        candidate = raw.get(key)
+        if isinstance(candidate, list):
+            return candidate
+    inner = raw.get("data")
+    if isinstance(inner, dict):
+        for key in ("items", "invoices"):
+            candidate = inner.get(key)
+            if isinstance(candidate, list):
+                return candidate
+    return []
+
+
+def main() -> None:
+    deadline = time.monotonic() + TOTAL_DEADLINE_SEC
+    base_url, api_key = resolve_target_and_credentials()
+
+    if not api_key:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "ok": False,
+                    "errorCode": "missing_api_key",
+                    "error": "Configure ~/.config/frihet/env (mode 0600) with FRIHET_API_KEY.",
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        return
+
+    now_local = datetime.datetime.now()
+    period = f"{now_local.year:04d}-{now_local.month:02d}"
+    opener = build_opener(use_tls=base_url.startswith("https://"))
+
+    ctx_raw = fetch_bounded_json(opener, f"{base_url}/context", api_key, deadline)
+    monthly_raw = fetch_bounded_json(
+        opener,
+        f"{base_url}/monthly?month={urllib.parse.quote(period, safe='')}",
+        api_key,
+        deadline,
+    )
+    invoices_raw = fetch_bounded_json(opener, f"{base_url}/invoices?limit=5", api_key, deadline)
+
+    ctx = unwrap_dict(ctx_raw)
+    monthly = unwrap_dict(monthly_raw)
+    raw_list = extract_invoices_list(invoices_raw)
+
+    ws_obj = ctx.get("workspace") if isinstance(ctx.get("workspace"), dict) else {}
+    workspace_name = (
+        str(
+            ctx.get("workspaceName")
+            or ctx.get("businessName")
+            or ctx.get("companyName")
+            or ctx.get("name")
+            or ws_obj.get("name")
+            or "Frihet ERP"
+        ).strip()[:64]
+        or "Frihet ERP"
+    )
+
+    currency = (
+        str(
+            ctx.get("currency")
+            or ctx.get("defaultCurrency")
+            or ws_obj.get("currency")
+            or monthly.get("currency")
+            or "EUR"
+        )
+        .strip()
+        .upper()[:8]
+        or "EUR"
+    )
+
+    rev_obj = monthly.get("revenue") if isinstance(monthly.get("revenue"), dict) else {}
+    exp_obj = monthly.get("expenses") if isinstance(monthly.get("expenses"), dict) else {}
+    prof_obj = monthly.get("profit") if isinstance(monthly.get("profit"), dict) else {}
+    tax_obj = monthly.get("taxLiability") if isinstance(monthly.get("taxLiability"), dict) else {}
+
+    revenue_total = first_finite(rev_obj.get("total"), monthly.get("revenueTotal"))
+    expenses_total = first_finite(exp_obj.get("total"), monthly.get("expensesTotal"))
+    net_profit = first_finite(prof_obj.get("net"), prof_obj.get("gross"), monthly.get("netProfit"))
+    vat_payable = first_finite(
+        tax_obj.get("vatPayable"),
+        tax_obj.get("estimatedModel303"),
+        monthly.get("vatPayable"),
+    )
+
+    inv_counts = (
+        monthly.get("invoices")
+        if isinstance(monthly.get("invoices"), dict)
+        else (monthly.get("counts") if isinstance(monthly.get("counts"), dict) else {})
+    )
+
+    recent_invoices = []
+    for raw_inv in raw_list[:5]:
+        if not isinstance(raw_inv, dict):
+            continue
+        client_obj = raw_inv.get("client") if isinstance(raw_inv.get("client"), dict) else {}
+        recent_invoices.append(
+            {
+                "id": str(raw_inv.get("id") or "")[:64],
+                "number": str(
+                    raw_inv.get("invoiceNumber")
+                    or raw_inv.get("documentNumber")
+                    or raw_inv.get("number")
+                    or raw_inv.get("id")
+                    or "-"
+                )[:32],
+                "clientName": str(
+                    raw_inv.get("clientName")
+                    or raw_inv.get("counterpartyName")
+                    or client_obj.get("name")
+                    or "Client"
+                )[:64],
+                "status": str(raw_inv.get("status") or "unknown")[:24],
+                "amount": first_finite(raw_inv.get("total"), raw_inv.get("amount")),
+                "currency": str(raw_inv.get("currency") or currency).strip().upper()[:8] or currency,
+            }
+        )
+
+    meta_obj = invoices_raw.get("meta") if isinstance(invoices_raw, dict) and isinstance(invoices_raw.get("meta"), dict) else {}
+    pag_obj = invoices_raw.get("pagination") if isinstance(invoices_raw, dict) and isinstance(invoices_raw.get("pagination"), dict) else {}
+    data_obj = invoices_raw.get("data") if isinstance(invoices_raw, dict) and isinstance(invoices_raw.get("data"), dict) else {}
+    raw_total = invoices_raw.get("total") if isinstance(invoices_raw, dict) else None
+
+    total_invoices_count = non_neg_int(
+        first_finite(
+            raw_total,
+            meta_obj.get("total"),
+            pag_obj.get("total"),
+            data_obj.get("total"),
+            len(recent_invoices),
+        )
+    )
+
+    payload = {
+        "ok": True,
+        "workspaceName": workspace_name,
+        "currency": currency,
+        "period": period,
+        "revenueTotal": revenue_total,
+        "expensesTotal": expenses_total,
+        "netProfit": net_profit,
+        "vatPayable": vat_payable,
+        "counts": {
+            "created": non_neg_int(inv_counts.get("created")),
+            "sent": non_neg_int(inv_counts.get("sent")),
+            "paid": non_neg_int(inv_counts.get("paid")),
+            "overdue": non_neg_int(inv_counts.get("overdue")),
+            "draft": non_neg_int(inv_counts.get("draft")),
+        },
+        "recentInvoices": recent_invoices,
+        "totalInvoicesCount": total_invoices_count,
+        "updatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    return result;
-  }
+    out = json.dumps(payload, separators=(",", ":"))
+    if len(out.encode("utf-8")) > 32768:
+        raise FetchError("response_too_large", "Normalized summary exceeded output budget.")
+    sys.stdout.write(out + "\n")
 
-  function loadConfig() {
-    const envPath = process.env.FRIHET_CONFIG_ENV || getDefaultEnvPath();
-    const fileVars = parseEnvFile(envPath);
-    const apiKey = (process.env.FRIHET_API_KEY || fileVars.FRIHET_API_KEY || "").trim();
-    const apiUrl = (process.env.FRIHET_API_URL || fileVars.FRIHET_API_URL || DEFAULT_API_BASE_URL).trim();
-    return { apiKey, apiUrl, envPath };
-  }
 
-  class FetchError extends Error {
-    constructor(errorCode, message) {
-      super(redactSecrets(message));
-      this.name = "FetchError";
-      this.errorCode = errorCode;
-    }
-  }
-
-  function validateSafeApiBaseUrl(rawUrl) {
-    const candidate = String(rawUrl || DEFAULT_API_BASE_URL).trim().replace(/\/+$/, "");
-    let parsed;
-    try {
-      parsed = new URL(candidate);
-    } catch {
-      throw new FetchError("invalid_base_url", "Invalid Frihet API base URL configured.");
-    }
-
-    if (parsed.username || parsed.password) {
-      throw new FetchError("invalid_base_url", "API base URL must not embed credentials.");
-    }
-
-    const host = parsed.hostname.toLowerCase();
-    const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
-    const allowLoopback = process.env.FRIHET_ALLOW_LOOPBACK_TEST === "1";
-
-    if (isLoopback) {
-      if (!allowLoopback) {
-        throw new FetchError("untrusted_base_url", "Loopback API URL is disabled outside test mode.");
-      }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        throw new FetchError("invalid_base_url", "API base URL must use HTTP or HTTPS.");
-      }
-      return candidate;
-    }
-
-    if (parsed.protocol !== "https:") {
-      throw new FetchError("insecure_base_url", "Frihet API base URL must use HTTPS.");
-    }
-
-    if (host !== "api.frihet.io" && !host.endsWith(".frihet.io")) {
-      throw new FetchError("untrusted_base_url", "Frihet API key can only be sent to *.frihet.io origins.");
-    }
-
-    return candidate;
-  }
-
-  function currentLocalYearMonth() {
-    const now = new Date();
-    const year = String(now.getFullYear());
-    const month = String(now.getMonth() + 1).padStart(2, "0");
-    return `${year}-${month}`;
-  }
-
-  async function readBoundedText(res, maxBytes) {
-    if (!res.body) return "";
-    const reader = res.body.getReader();
-    const chunks = [];
-    let total = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) {
-        total += value.byteLength;
-        if (total > maxBytes) {
-          try {
-            await reader.cancel();
-          } catch {
-            // ignore cancel errors
-          }
-          throw new FetchError("response_too_large", `API response exceeded ${maxBytes} byte cap.`);
-        }
-        chunks.push(Buffer.from(value));
-      }
-    }
-
-    return Buffer.concat(chunks, total).toString("utf8");
-  }
-
-  async function fetchBoundedJson(url, apiKey) {
-    let res;
-    try {
-      res = await fetch(url, {
-        method: "GET",
-        redirect: "manual",
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        headers: {
-          "X-API-Key": apiKey,
-          "X-Frihet-Source": "omarchy-quickshell",
-          "User-Agent": "frihet-omarchy/1.0.0",
-          "Accept": "application/json"
-        }
-      });
-    } catch (err) {
-      const msg = err && err.name === "TimeoutError"
-        ? "Frihet API request timed out."
-        : `Could not reach Frihet API: ${err && err.message ? err.message : "network error"}`;
-      throw new FetchError("network_error", msg);
-    }
-
-    if (res.status >= 300 && res.status < 400) {
-      throw new FetchError("redirect_blocked", `Refusing HTTP redirect (${res.status}) from API.`);
-    }
-
-    const text = await readBoundedText(res, MAX_RESPONSE_BYTES);
-    let parsed = null;
-    if (text.trim() !== "") {
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        if (res.ok) {
-          throw new FetchError("invalid_json", "Frihet API returned invalid JSON.");
-        }
-      }
-    }
-
-    if (!res.ok) {
-      const detail = parsed && typeof parsed === "object"
-        ? (parsed.message || parsed.error || "")
-        : "";
-      if (res.status === 401) {
-        throw new FetchError("unauthorized", `Invalid or revoked API key (401). ${detail}`.trim());
-      }
-      if (res.status === 403) {
-        throw new FetchError("forbidden", `API key lacks workspace permissions (403). ${detail}`.trim());
-      }
-      if (res.status === 429) {
-        throw new FetchError("rate_limited", "Frihet API rate limit exceeded (429). Retry shortly.");
-      }
-      throw new FetchError("http_error", `Frihet API error (${res.status}). ${detail}`.trim());
-    }
-
-    return parsed;
-  }
-
-  function unwrapObject(raw) {
-    if (!raw || typeof raw !== "object") return {};
-    if (raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)) {
-      return raw.data;
-    }
-    return raw;
-  }
-
-  function firstFinite(...values) {
-    for (const v of values) {
-      if (typeof v === "number" && Number.isFinite(v)) return v;
-    }
-    return null;
-  }
-
-  function nonNegInt(v) {
-    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
-  }
-
-  function extractInvoicesArray(raw) {
-    if (Array.isArray(raw)) return raw;
-    if (!raw || typeof raw !== "object") return [];
-    if (Array.isArray(raw.data)) return raw.data;
-    if (Array.isArray(raw.items)) return raw.items;
-    if (Array.isArray(raw.invoices)) return raw.invoices;
-    if (raw.data && typeof raw.data === "object") {
-      if (Array.isArray(raw.data.items)) return raw.data.items;
-      if (Array.isArray(raw.data.invoices)) return raw.data.invoices;
-    }
-    return [];
-  }
-
-  async function main() {
-    const { apiKey, apiUrl } = loadConfig();
-
-    if (!apiKey) {
-      process.stdout.write(
-        JSON.stringify({
-          ok: false,
-          errorCode: "missing_api_key",
-          error: "API key not configured. Run frihet-omarchy-setup."
-        }) + "\n"
-      );
-      return;
-    }
-
-    const safeBaseUrl = validateSafeApiBaseUrl(apiUrl);
-    const period = currentLocalYearMonth();
-
-    const [ctxRaw, monthlyRaw, invoicesRaw] = await Promise.all([
-      fetchBoundedJson(`${safeBaseUrl}/context`, apiKey),
-      fetchBoundedJson(`${safeBaseUrl}/monthly?month=${encodeURIComponent(period)}`, apiKey),
-      fetchBoundedJson(`${safeBaseUrl}/invoices?limit=5`, apiKey)
-    ]);
-
-    const ctx = unwrapObject(ctxRaw);
-    const monthly = unwrapObject(monthlyRaw);
-    const rawList = extractInvoicesArray(invoicesRaw);
-
-    const workspaceName = String(
-      ctx.workspaceName ||
-        ctx.businessName ||
-        ctx.companyName ||
-        ctx.name ||
-        (ctx.workspace && ctx.workspace.name) ||
-        "Frihet ERP"
-    ).trim() || "Frihet ERP";
-
-    const currency = String(
-      ctx.currency ||
-        ctx.defaultCurrency ||
-        (ctx.workspace && ctx.workspace.currency) ||
-        monthly.currency ||
-        "EUR"
-    ).trim().toUpperCase() || "EUR";
-
-    const revenueTotal = firstFinite(monthly.revenue && monthly.revenue.total, monthly.revenueTotal);
-    const expensesTotal = firstFinite(monthly.expenses && monthly.expenses.total, monthly.expensesTotal);
-    const netProfit = firstFinite(
-      monthly.profit && monthly.profit.net,
-      monthly.profit && monthly.profit.gross,
-      monthly.netProfit
-    );
-    const vatPayable = firstFinite(
-      monthly.taxLiability && monthly.taxLiability.vatPayable,
-      monthly.taxLiability && monthly.taxLiability.estimatedModel303,
-      monthly.vatPayable
-    );
-
-    const invCounts = (monthly.invoices && typeof monthly.invoices === "object"
-      ? monthly.invoices
-      : monthly.counts && typeof monthly.counts === "object"
-        ? monthly.counts
-        : {});
-
-    const recentInvoices = rawList.slice(0, 5).map((inv) => {
-      const item = inv && typeof inv === "object" ? inv : {};
-      return {
-        id: String(item.id || ""),
-        number: String(item.invoiceNumber || item.documentNumber || item.number || item.id || "-"),
-        clientName: String(
-          item.clientName ||
-            item.counterpartyName ||
-            (item.client && item.client.name) ||
-            "Client"
-        ),
-        status: String(item.status || "unknown"),
-        amount: firstFinite(item.total, item.amount),
-        currency: String(item.currency || currency).toUpperCase()
-      };
-    });
-
-    const totalInvoicesCount = nonNegInt(
-      firstFinite(
-        invoicesRaw && invoicesRaw.total,
-        invoicesRaw && invoicesRaw.meta && invoicesRaw.meta.total,
-        invoicesRaw && invoicesRaw.pagination && invoicesRaw.pagination.total,
-        invoicesRaw && invoicesRaw.data && !Array.isArray(invoicesRaw.data) && invoicesRaw.data.total,
-        recentInvoices.length
-      )
-    );
-
-    const payload = {
-      ok: true,
-      workspaceName,
-      currency,
-      period,
-      revenueTotal,
-      expensesTotal,
-      netProfit,
-      vatPayable,
-      counts: {
-        created: nonNegInt(invCounts.created),
-        sent: nonNegInt(invCounts.sent),
-        paid: nonNegInt(invCounts.paid),
-        overdue: nonNegInt(invCounts.overdue),
-        draft: nonNegInt(invCounts.draft)
-      },
-      recentInvoices,
-      totalInvoicesCount,
-      updatedAt: new Date().toISOString()
-    };
-
-    process.stdout.write(JSON.stringify(payload) + "\n");
-  }
-
-  try {
-    await main();
-  } catch (err) {
-    const errorCode = err && err.errorCode ? String(err.errorCode) : "fetch_failed";
-    const error = redactSecrets(err && err.message ? err.message : "Failed to fetch Frihet data");
-    process.stdout.write(JSON.stringify({ ok: false, errorCode, error }) + "\n");
-  }
-})();
+if __name__ == "__main__":
+    try:
+        main()
+    except FetchError as err:
+        sys.stdout.write(
+            json.dumps(
+                {"ok": False, "errorCode": err.error_code, "error": redact_secrets(str(err))[:160]},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+    except Exception as err:
+        sys.stdout.write(
+            json.dumps(
+                {"ok": False, "errorCode": "fetch_failed", "error": redact_secrets(str(err))[:160]},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )

@@ -2,34 +2,43 @@
 
 [![CI](https://github.com/Frihet-io/frihet-omarchy/actions/workflows/ci.yml/badge.svg)](https://github.com/Frihet-io/frihet-omarchy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![MCP Server](https://img.shields.io/badge/%40frihet%2Fmcp--server-2.0.2-black.svg)](https://www.npmjs.com/package/@frihet/mcp-server)
 
-Official integration suite for running **Frihet ERP** on **Omarchy** (Arch Linux + Hyprland + Quickshell):
+Native **Omarchy Quattro** (`omarchy-shell` / Quickshell) bar widget (`io.frihet.erp`) for [Frihet ERP](https://frihet.io). Displays live monthly revenue, overdue invoice alerts, net result, estimated VAT, and your latest 5 invoices directly in the Omarchy bar using active theme colors and typography.
 
-1. **Quickshell Bar Widget (`io.frihet.erp`)**: Live monthly revenue, overdue invoice alerts, VAT estimate, and recent invoices directly in the Omarchy bar, inheriting active theme colors and font family.
-2. **Frameless Wayland Web App (`aur/frihet-webapp`)**: Launches `https://app.frihet.io` via `omarchy-launch-webapp` / Chromium `--app=` with official Frihet icons and zero browser chrome.
-3. **Terminal MCP + CLI (`aur/frihet-mcp`)**: Packages `@frihet/mcp-server@2.0.2`, `frihet-omarchy-setup` (wires Claude Code and OpenCode in one command), and `frihet-cli`.
+![Frihet ERP Omarchy Bar Widget Preview](preview.png)
 
----
+## Installation
 
-## 1. Quickshell Bar Widget (`io.frihet.erp`)
-
-Install directly from GitHub on **Omarchy Quattro**:
+Install and enable on Omarchy Quattro:
 
 ```bash
 omarchy plugin add https://github.com/Frihet-io/frihet-omarchy.git --enable
 ```
 
-Or link a local clone for development:
+## Configuration
+
+The widget is strictly read-only and reads a single `0600` owner-only credential file at `~/.config/frihet/env`. Create it with an API key from **Frihet ERP -> Settings -> API Keys**:
 
 ```bash
-mkdir -p ~/.config/omarchy/plugins
-ln -sfn "$(pwd)" ~/.config/omarchy/plugins/io.frihet.erp
-omarchy plugin validate ~/.config/omarchy/plugins/io.frihet.erp
-qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml
-omarchy-shell shell rescanPlugins
-omarchy plugin enable io.frihet.erp --section right
+mkdir -p -m 700 ~/.config/frihet
+(umask 077 && printf 'FRIHET_API_KEY=fri_your_key_here\n' > ~/.config/frihet/env)
 ```
+
+Right-click the bar pill (or run `omarchy-shell io.frihet.erp refresh`) to load your workspace immediately.
+
+## Controls & Shortcuts
+
+Bar pill:
+- **Left-click**: Open or close summary panel
+- **Middle-click**: Open `https://app.frihet.io` via `xdg-open`
+- **Right-click**: Refresh immediately
+
+Inside open panel:
+- **`r`**: Refresh snapshot
+- **`n`**: Open `https://app.frihet.io/invoices/new` in browser
+- **`o`**: Open `https://app.frihet.io` in browser
+- **`Tab` / `Shift+Tab`**: Switch between bar panels
+- **`Esc`**: Close panel
 
 Optional Hyprland binding (`~/.config/hypr/bindings.conf`):
 
@@ -37,78 +46,42 @@ Optional Hyprland binding (`~/.config/hypr/bindings.conf`):
 bindd = SUPER SHIFT, B, Frihet Summary, exec, omarchy-shell shell summon io.frihet.erp {}
 ```
 
-Bar pill interactions:
-- **Left-click**: Open or close summary panel
-- **Middle-click**: Open `https://app.frihet.io`
-- **Right-click**: Force immediate refresh
+## Dependencies
 
----
+All runtime tools ship pre-installed in stock Omarchy / Arch Linux:
+- `/usr/bin/python3` (Python 3 standard library only; zero third-party packages)
+- `/usr/bin/setsid` (`util-linux`) and `/usr/bin/timeout` (`coreutils`)
+- `/usr/bin/xdg-open` (`xdg-utils`)
 
-## 2. Frameless Wayland Web App (`aur/frihet-webapp`)
+Companion Frihet integrations (optional, separate repositories):
+- Official MCP Server: [Frihet-io/frihet-mcp](https://github.com/Frihet-io/frihet-mcp)
+- Arch Linux PKGBUILDs & CLI: [Frihet-io/frihet-arch](https://github.com/Frihet-io/frihet-arch)
 
-### Direct Omarchy Install
+## Data, Network & Security Boundaries
 
-```bash
-bash aur/frihet-webapp/install-omarchy-webapp.sh
-```
+- **Network endpoints**: Performs read-only HTTPS `GET` requests exclusively to the fixed origin `https://api.frihet.io/v1` (`/context`, `/monthly`, `/invoices?limit=5`). HTTP redirects (`3xx`) and environment proxies are refused, and responses are capped at 256 KiB.
+- **Credential handling**: Reads `~/.config/frihet/env` via descriptor-walked `O_NOFOLLOW` checks requiring a regular `0600` file owned by the current UID with link count `1`. Credentials never appear in process `argv` and are redacted in error messages.
+- **Filesystem footprint**: This plugin writes **zero files** to disk (no cache files, sockets, background daemons, or shared config edits).
+- **UI rendering**: Every QML `Text` item pins `textFormat: Text.PlainText` with bounded width, and strings passed to host bar controls strip `<`, `>`, `&`, control characters, and bidi overrides.
 
-### Build & Install via `makepkg`
+## Removal
 
-```bash
-cd aur/frihet-webapp
-makepkg -si
-```
-
-Optional Hyprland shortcut (`~/.config/hypr/bindings.conf`):
-
-```ini
-bindd = SUPER SHIFT, F, Frihet ERP, exec, omarchy-launch-webapp "https://app.frihet.io"
-```
-
----
-
-## 3. Terminal MCP Server + CLI (`aur/frihet-mcp`)
-
-### Build & Install Package
+Remove the plugin from Omarchy:
 
 ```bash
-cd aur/frihet-mcp
-makepkg -si
+omarchy plugin remove io.frihet.erp
 ```
 
-### Configure API Key & AI Agents
+What is removed vs kept:
+- Deleted by Omarchy: `~/.config/omarchy/plugins/io.frihet.erp` and its bar placement entry.
+- Kept (user-created): `~/.config/frihet/env` is not deleted automatically so other Frihet CLI/MCP tools keep working. Delete `~/.config/frihet/env` manually if you no longer need the stored API key.
 
-Run once to verify your `fri_...` API key against `/v1/context`, store `~/.config/frihet/env` (`0600`), and register the `frihet` MCP server in `~/.claude.json` (Claude Code) and `~/.config/opencode/opencode.json` (OpenCode):
-
-```bash
-frihet-omarchy-setup
-```
-
-### CLI Commands
+## Verification
 
 ```bash
-frihet-cli status
-frihet-cli monthly 2026-11
-frihet-cli quarterly 2026-Q4
-frihet-cli invoices --limit 10
-frihet-cli draft-invoice --client-id cli_123 --description "Advisory" --qty 1 --unit-price 1500 --tax-rate 21
-```
-
----
-
-## Security & Fiscal Safety Invariants
-
-- **Draft-only mutations**: `frihet-cli draft-invoice` and `@frihet/mcp-server` always create invoices with `status="draft"` and `Idempotency-Key` protection. Finalizing invoices, VeriFactu / AEAT / TicketBAI submissions, and real-money payments require explicit human confirmation in `https://app.frihet.io`.
-- **Origin pinning & redirect protection**: API calls fail closed unless the target base URL resolves to `https://*.frihet.io` (loopback allowed only under explicit `FRIHET_ALLOW_LOOPBACK_TEST=1`), reject HTTP redirects (`redirect: "manual"`), and cap response bodies to 256 KiB.
-- **UI & log hygiene**: QML `Text` nodes enforce `Text.PlainText` with bounded width and sanitized input (`Model.clean()`), and `fri_...` keys are masked in setup output and redacted from error messages.
-
----
-
-## Development & Verification
-
-```bash
+python3 -m py_compile bin/frihet-omarchy-fetch
 node scripts/no-public-leak.mjs
 node --test tests/omarchy-suite.test.mjs
 ```
 
-See [SECURITY.md](SECURITY.md) for private vulnerability reporting and [LICENSE](LICENSE) (MIT).
+See [SECURITY.md](SECURITY.md) and [LICENSE](LICENSE) (MIT).

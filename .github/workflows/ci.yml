@@ -32,12 +32,8 @@ jobs:
         with:
           node-version: 22.23.4
 
-      - name: Shell & PKGBUILD syntax check
-        run: |
-          bash -n aur/frihet-webapp/frihet-erp-webapp \
-                  aur/frihet-webapp/install-omarchy-webapp.sh \
-                  aur/frihet-webapp/PKGBUILD \
-                  aur/frihet-mcp/PKGBUILD
+      - name: Python helper syntax check
+        run: python3 -I -m py_compile bin/frihet-omarchy-fetch
 
       - name: Public surface & secret leak audit
         run: node scripts/no-public-leak.mjs

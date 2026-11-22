@@ -1,12 +1,12 @@
-var PLUGIN_ID = "io.frihet.erp";
-var MAX_PAYLOAD_BYTES = 262144;
+const PLUGIN_ID = "io.frihet.erp";
+const MAX_PAYLOAD_BYTES = 65536;
 
 function clean(value, maxLen) {
   if (value === null || value === undefined) return "";
-  var limit = typeof maxLen === "number" && maxLen > 0 ? maxLen : 120;
-  var str = String(value)
-    .replace(/[<>]/g, "")
-    .replace(/[\x00-\x1F\x7F]/g, " ")
+  const limit = typeof maxLen === "number" && maxLen > 0 ? maxLen : 120;
+  const str = String(value)
+    .replace(/[<>&]/g, "")
+    .replace(/[\x00-\x1F\x7F-\x9F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   if (str.length > limit) {
@@ -50,10 +50,10 @@ function emptyState() {
 }
 
 function mergeState(overrides) {
-  var base = emptyState();
+  const base = emptyState();
   if (!overrides) return base;
-  var keys = Object.keys(overrides);
-  for (var i = 0; i < keys.length; i++) {
+  const keys = Object.keys(overrides);
+  for (let i = 0; i < keys.length; i++) {
     base[keys[i]] = overrides[keys[i]];
   }
   return base;
@@ -62,14 +62,14 @@ function mergeState(overrides) {
 function formatMoney(amount, currency, mixedCurrency) {
   if (mixedCurrency === true) return "MIXED";
   if (!isFiniteNumber(amount)) return "N/A";
-  var curr = clean(currency || "EUR", 8).toUpperCase() || "EUR";
+  const curr = clean(currency || "EUR", 8).toUpperCase() || "EUR";
   return amount.toFixed(2) + " " + curr;
 }
 
 function formatCompactMoney(amount, currency, mixedCurrency) {
   if (mixedCurrency === true) return "MIXED";
   if (!isFiniteNumber(amount)) return "N/A";
-  var curr = clean(currency || "EUR", 8).toUpperCase() || "EUR";
+  const curr = clean(currency || "EUR", 8).toUpperCase() || "EUR";
   if (Math.abs(amount) >= 1000) {
     return (amount / 1000).toFixed(1).replace(/\.0$/, "") + "k " + curr;
   }
@@ -78,7 +78,7 @@ function formatCompactMoney(amount, currency, mixedCurrency) {
 
 function parsePayload(raw) {
   if (typeof raw !== "string" || raw.trim() === "" || raw.length > MAX_PAYLOAD_BYTES) {
-    var invalidMsg = "Invalid or oversized payload";
+    const invalidMsg = "Invalid or oversized payload";
     return {
       ok: false,
       configured: true,
@@ -91,11 +91,11 @@ function parsePayload(raw) {
     };
   }
 
-  var data;
+  let data;
   try {
     data = JSON.parse(raw);
   } catch (_err) {
-    var parseMsg = "Malformed JSON response";
+    const parseMsg = "Malformed JSON response";
     return {
       ok: false,
       configured: true,
@@ -109,7 +109,7 @@ function parsePayload(raw) {
   }
 
   if (!data || typeof data !== "object" || Array.isArray(data)) {
-    var shapeMsg = "Malformed JSON response";
+    const shapeMsg = "Malformed JSON response";
     return {
       ok: false,
       configured: true,
@@ -123,7 +123,10 @@ function parsePayload(raw) {
   }
 
   if (data.errorCode === "missing_api_key") {
-    var setupMsg = clean(data.error || "Run frihet-omarchy-setup to configure API key", 140);
+    const setupMsg = clean(
+      data.error || "Configure ~/.config/frihet/env (mode 0600) with FRIHET_API_KEY",
+      140
+    );
     return {
       ok: false,
       configured: false,
@@ -137,7 +140,7 @@ function parsePayload(raw) {
   }
 
   if (data.ok !== true) {
-    var apiErrMsg = clean(data.error || "Frihet API error", 140);
+    const apiErrMsg = clean(data.error || "Frihet API error", 140);
     return {
       ok: false,
       configured: true,
@@ -150,27 +153,27 @@ function parsePayload(raw) {
     };
   }
 
-  var currency = clean(data.currency || "EUR", 8).toUpperCase() || "EUR";
-  var seenCurrencies = {};
+  const currency = clean(data.currency || "EUR", 8).toUpperCase() || "EUR";
+  const seenCurrencies = Object.create(null);
   if (data.currency) {
     seenCurrencies[currency] = true;
   }
 
-  var rawInvoices = Array.isArray(data.recentInvoices) ? data.recentInvoices : [];
-  var recentInvoices = [];
-  var maxInvoices = Math.min(rawInvoices.length, 5);
+  const rawInvoices = Array.isArray(data.recentInvoices) ? data.recentInvoices : [];
+  const recentInvoices = [];
+  const maxInvoices = Math.min(rawInvoices.length, 5);
 
-  for (var i = 0; i < maxInvoices; i++) {
-    var inv = rawInvoices[i];
+  for (let i = 0; i < maxInvoices; i++) {
+    const inv = rawInvoices[i];
     if (!inv || typeof inv !== "object") continue;
 
-    var invCurrRaw = inv.currency ? clean(inv.currency, 8).toUpperCase() : "";
+    const invCurrRaw = inv.currency ? clean(inv.currency, 8).toUpperCase() : "";
     if (invCurrRaw) {
       seenCurrencies[invCurrRaw] = true;
     }
-    var invCurrency = invCurrRaw || currency;
+    const invCurrency = invCurrRaw || currency;
 
-    var invAmount = isFiniteNumber(inv.amount)
+    const invAmount = isFiniteNumber(inv.amount)
       ? inv.amount
       : (isFiniteNumber(inv.total) ? inv.total : null);
 
@@ -184,15 +187,15 @@ function parsePayload(raw) {
     });
   }
 
-  var currencyCount = Object.keys(seenCurrencies).length;
-  var mixedCurrency = data.mixedCurrency === true || currencyCount > 1;
-  var counts = data.counts && typeof data.counts === "object" ? data.counts : {};
-  var totalInvoicesCount = isFiniteNumber(data.totalInvoicesCount) && data.totalInvoicesCount >= 0
+  const currencyCount = Object.keys(seenCurrencies).length;
+  const mixedCurrency = data.mixedCurrency === true || currencyCount > 1;
+  const counts = data.counts && typeof data.counts === "object" ? data.counts : {};
+  const totalInvoicesCount = isFiniteNumber(data.totalInvoicesCount) && data.totalInvoicesCount >= 0
     ? Math.floor(data.totalInvoicesCount)
     : recentInvoices.length;
-  var partialSample = totalInvoicesCount > recentInvoices.length;
+  const partialSample = totalInvoicesCount > recentInvoices.length;
 
-  var state = {
+  const state = {
     configured: true,
     ok: true,
     loading: false,
@@ -223,12 +226,12 @@ function parsePayload(raw) {
   };
 }
 
-function barLabel(state, showAmountInBar, refreshing, lastError) {
+function barLabel(state, showAmountInBar, _refreshing, lastError) {
   if (!state || state.loading) return "Frihet ...";
-  if (!state.configured) return "Frihet [setup]";
+  if (!state.configured) return "Frihet [key]";
   if (lastError && !state.ok) return "Frihet !";
 
-  var base = "Frihet";
+  let base = "Frihet";
   if (showAmountInBar !== false && isFiniteNumber(state.revenueTotal)) {
     base = "Frihet " + formatCompactMoney(state.revenueTotal, state.currency, state.mixedCurrency);
   } else if (showAmountInBar !== false && state.mixedCurrency === true) {
@@ -239,7 +242,7 @@ function barLabel(state, showAmountInBar, refreshing, lastError) {
     base += " [" + Math.floor(state.overdueCount) + "!]";
   }
 
-  var result = clean(base, 48);
+  const result = clean(base, 48);
   return result || "Frihet";
 }
 
@@ -248,13 +251,13 @@ function tooltipLabel(state, lastError) {
     return "Frihet ERP - Loading...";
   }
   if (!state.configured) {
-    return "Frihet ERP - Setup required (run frihet-omarchy-setup)";
+    return "Frihet ERP - Configure ~/.config/frihet/env (mode 0600)";
   }
   if (lastError && !state.ok) {
     return clean("Frihet ERP - Error: " + lastError, 160);
   }
 
-  var parts = [
+  const parts = [
     clean(state.workspaceName || "Frihet ERP", 48),
     state.period ? "Period: " + clean(state.period, 16) : "",
     "Revenue: " + formatMoney(state.revenueTotal, state.currency, state.mixedCurrency),
@@ -263,8 +266,8 @@ function tooltipLabel(state, lastError) {
   if (lastError) {
     parts.push("Stale warning: " + clean(lastError, 64));
   }
-  var nonEmpty = [];
-  for (var i = 0; i < parts.length; i++) {
+  const nonEmpty = [];
+  for (let i = 0; i < parts.length; i++) {
     if (parts[i]) nonEmpty.push(parts[i]);
   }
   return clean(nonEmpty.join(" | "), 240);

@@ -6,3 +6,6 @@ aur/*/pkg/
 aur/*/src/
 aur/*/*.pkg.tar.*
 aur/*/*.tgz
+
+__pycache__/
+*.py[cod]
